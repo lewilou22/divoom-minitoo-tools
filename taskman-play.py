@@ -2,8 +2,8 @@
 """Live Task Manager dashboard on MiniToo (160x128) plus a scaled PC preview.
 
 Renders native pixels — does not capture the real Task Manager window, which
-would be unreadable at 160x128. JPEG 4:4:4 + a 5x7 bitmap font keep labels
-sharp on the panel.
+would be unreadable at 160x128. Default live blob is magic 0x25 (RGB + zstd)
+so the 5x7 bitmap font stays sharp; JPEG 4:4:4 is the fallback.
 
   py -3 core/taskman-play.py
   py -3 core/taskman-play.py --preview
@@ -33,9 +33,8 @@ from minitoo_protocol import (
     HEIGHT,
     MIN_SPEED_MS,
     WIDTH,
-    encode_live_blob,
+    encode_live_images,
     is_live_ready,
-    jpeg_bytes,
     live_announce,
     live_chunk_frames,
     requested_chunk_index,
@@ -548,7 +547,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--com", help="Windows Bluetooth serial port, e.g. COM16")
     parser.add_argument("--rfcomm-channel", type=int, default=0)
     parser.add_argument("--hz", type=float, default=1.0, help="Dashboard refresh rate (Task Manager is ~1 Hz)")
-    parser.add_argument("--quality", type=int, default=88, help="JPEG quality; keep high so text stays sharp")
+    parser.add_argument("--quality", type=int, default=88, help="JPEG quality; used only if zstd 0x25 is too big")
+    parser.add_argument(
+        "--blob",
+        choices=("auto", "25", "23"),
+        default="25",
+        help="0x8B payload: 25=app RGB+zstd (sharp text), 23=JPEG, auto=25 then JPEG fallback",
+    )
     parser.add_argument("--pace-ms", type=int, default=0)
     parser.add_argument("--announce-timeout", type=float, default=0.8)
     parser.add_argument("--top", type=int, default=4, help="Process rows")
@@ -617,7 +622,9 @@ def main() -> int:
                 if not args.no_window:
                     frames.put(img)
                 if transport is not None:
-                    blob = encode_live_blob([jpeg_bytes(img, args.quality, subsampling=0)], MIN_SPEED_MS)
+                    blob, used = encode_live_images(
+                        [img], speed_ms=MIN_SPEED_MS, magic=args.blob, quality=args.quality, subsampling=0
+                    )
                     started = time.time()
                     chunks = send_live_clip(transport, blob, args.pace_ms / 1000.0, args.announce_timeout)
                     sent += 1
@@ -625,7 +632,7 @@ def main() -> int:
                     print(
                         f"cpu {snap.cpu:5.1f}%  ram {snap.ram_pct:4.1f}%  "
                         f"net {fmt_rate(snap.net_down)}/{fmt_rate(snap.net_up)}  "
-                        f"{len(blob)}B/{chunks}ch {xfer:.2f}s"
+                        f"0x{used} {len(blob)}B/{chunks}ch {xfer:.2f}s"
                     )
                 next_tick = time.time() + (1.0 / args.hz)
         except Exception as exc:

@@ -5,13 +5,16 @@ This is a 160x128 preview, not a real monitor. Each update is a 1-frame (or
 short) 0x8B clip. The next clip is announced only after the current transfer
 finishes — overlapping uploads froze the panel.
 
-Expect several frames per second, possible LOADING flashes between clips, and
-a hardware-button press to leave the live view.
+Default encoding is magic 0x25 (RGB + zstd) until the blob exceeds 12 KB,
+then JPEG 0x23 — a busy desktop does not zstd well and stalls the radio.
+Bluetooth speaker audio (A2DP) shares this Classic link with SPP; use the
+USB "Divoom Audio" output if you want sound without starving the screen.
 
 Examples:
-  python core/screen-play.py
-  python core/screen-play.py --fps 8
-  python core/screen-play.py --fit contain
+  python core/screen-play.py --fast
+  python core/screen-play.py --fast --res auto
+  python core/screen-play.py --res 800x600
+  python core/screen-play.py --list-res
   python core/screen-play.py --bbox 0,0,1920,1080
 """
 
@@ -35,9 +38,8 @@ from minitoo_protocol import (
     MIN_SPEED_MS,
     RESAMPLE_MODES,
     WIDTH,
-    encode_live_blob,
+    encode_live_images,
     is_live_ready,
-    jpeg_bytes,
     live_announce,
     live_chunk_frames,
     render_frame,
@@ -50,6 +52,7 @@ from minitoo_rfcomm import (
     default_mac,
     list_windows_devices,
 )
+from usb_minitoo import usb_audio_present
 
 SRCCOPY = 0x00CC0020
 COLORONCOLOR = 3
@@ -61,6 +64,79 @@ SM_XVIRTUALSCREEN = 76
 SM_YVIRTUALSCREEN = 77
 SM_CXVIRTUALSCREEN = 78
 SM_CYVIRTUALSCREEN = 79
+ENUM_CURRENT_SETTINGS = -1
+CDS_FULLSCREEN = 0x00000004
+DISP_CHANGE_SUCCESSFUL = 0
+DM_PELSWIDTH = 0x00080000
+DM_PELSHEIGHT = 0x00100000
+DM_BITSPERPEL = 0x00040000
+DM_DISPLAYFREQUENCY = 0x00400000
+# Lowest common modes first so UI is chunky on 160x128. 5:4 (800x640) is ideal if the GPU offers it.
+PREFERRED_RES = (
+    (800, 640),
+    (640, 512),
+    (800, 600),
+    (640, 480),
+    (1024, 768),
+    (960, 768),
+    (1280, 1024),
+)
+
+
+class _DevmodeUnion(ctypes.Union):
+    class _Printer(ctypes.Structure):
+        _fields_ = (
+            ("dmOrientation", ctypes.c_short),
+            ("dmPaperSize", ctypes.c_short),
+            ("dmPaperLength", ctypes.c_short),
+            ("dmPaperWidth", ctypes.c_short),
+            ("dmScale", ctypes.c_short),
+            ("dmCopies", ctypes.c_short),
+            ("dmDefaultSource", ctypes.c_short),
+            ("dmPrintQuality", ctypes.c_short),
+        )
+
+    class _Display(ctypes.Structure):
+        _fields_ = (
+            ("dmPosition_x", ctypes.c_long),
+            ("dmPosition_y", ctypes.c_long),
+            ("dmDisplayOrientation", ctypes.c_ulong),
+            ("dmDisplayFixedOutput", ctypes.c_ulong),
+        )
+
+    _fields_ = (("printer", _Printer), ("display", _Display))
+
+
+class DEVMODEW(ctypes.Structure):
+    _fields_ = (
+        ("dmDeviceName", ctypes.c_wchar * 32),
+        ("dmSpecVersion", ctypes.c_ushort),
+        ("dmDriverVersion", ctypes.c_ushort),
+        ("dmSize", ctypes.c_ushort),
+        ("dmDriverExtra", ctypes.c_ushort),
+        ("dmFields", ctypes.c_ulong),
+        ("u", _DevmodeUnion),
+        ("dmColor", ctypes.c_short),
+        ("dmDuplex", ctypes.c_short),
+        ("dmYResolution", ctypes.c_short),
+        ("dmTTOption", ctypes.c_short),
+        ("dmCollate", ctypes.c_short),
+        ("dmFormName", ctypes.c_wchar * 32),
+        ("dmLogPixels", ctypes.c_ushort),
+        ("dmBitsPerPel", ctypes.c_ulong),
+        ("dmPelsWidth", ctypes.c_ulong),
+        ("dmPelsHeight", ctypes.c_ulong),
+        ("dmDisplayFlags", ctypes.c_ulong),
+        ("dmDisplayFrequency", ctypes.c_ulong),
+        ("dmICMMethod", ctypes.c_ulong),
+        ("dmICMIntent", ctypes.c_ulong),
+        ("dmMediaType", ctypes.c_ulong),
+        ("dmDitherType", ctypes.c_ulong),
+        ("dmReserved1", ctypes.c_ulong),
+        ("dmReserved2", ctypes.c_ulong),
+        ("dmPanningWidth", ctypes.c_ulong),
+        ("dmPanningHeight", ctypes.c_ulong),
+    )
 
 
 class BITMAPINFOHEADER(ctypes.Structure):
@@ -108,30 +184,38 @@ def connect(args: argparse.Namespace) -> MiniTooTransport:
     return transport
 
 
+_ACK_WARNED = False
+
+
 def send_live_clip(transport: MiniTooTransport, blob: bytes, pace_s: float, announce_timeout: float) -> int:
+    global _ACK_WARNED
     chunks = live_chunk_frames(blob)
     transport.recv_frames(0.0)
     ready = False
-    wait_s = max(0.35, announce_timeout)
-    for _attempt in range(2):
-        transport.send(live_announce(blob))
+    wait_s = max(0.0, announce_timeout)
+    transport.send(live_announce(blob))
+    if wait_s > 0:
         deadline = time.time() + wait_s
         while time.time() < deadline:
-            for packet in transport.recv_frames(min(0.05, max(0.01, deadline - time.time()))):
+            for packet in transport.recv_frames(min(0.015, max(0.004, deadline - time.time()))):
                 if is_live_ready(packet):
                     ready = True
                     break
             if ready:
                 break
-        if ready:
-            break
-    if not ready:
-        print("  warning: no 0x8B ready ACK before chunks")
+    if not ready and wait_s > 0 and not _ACK_WARNED:
+        print(
+            "  warning: no 0x8B ready ACK (sending anyway; further misses are silent). "
+            "Bluetooth speaker audio on this same radio makes ACKs late."
+        )
+        _ACK_WARNED = True
     transport.send_all(chunks, pace_s)
-    extra = 0.08 if pace_s <= 0 else min(0.4, max(0.08, len(chunks) * pace_s))
+    extra = 0.008 + min(0.05, 0.00035 * len(chunks))
+    if pace_s > 0:
+        extra = min(0.2, max(extra, len(chunks) * pace_s))
     end = time.time() + extra
     while time.time() < end:
-        for packet in transport.recv_frames(0.04):
+        for packet in transport.recv_frames(0.015):
             index = requested_chunk_index(packet)
             if index is not None and 0 <= index < len(chunks):
                 transport.send(chunks[index])
@@ -146,6 +230,103 @@ def parse_bbox(value: str) -> tuple[int, int, int, int]:
     if w <= 0 or h <= 0:
         raise argparse.ArgumentTypeError("bbox width and height must be positive")
     return x, y, w, h
+
+
+def parse_res(value: str) -> str | tuple[int, int]:
+    lowered = value.strip().lower()
+    if lowered == "auto":
+        return "auto"
+    if "x" not in lowered:
+        raise argparse.ArgumentTypeError("resolution must be WxH or auto, e.g. 800x600")
+    width_s, height_s = lowered.split("x", 1)
+    try:
+        width, height = int(width_s), int(height_s)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("resolution must be WxH or auto") from exc
+    if width < 160 or height < 128:
+        raise argparse.ArgumentTypeError("resolution must be at least 160x128")
+    return width, height
+
+
+def _blank_devmode() -> DEVMODEW:
+    mode = DEVMODEW()
+    mode.dmSize = ctypes.sizeof(DEVMODEW)
+    return mode
+
+
+def current_display_mode() -> tuple[int, int, int, int]:
+    mode = _blank_devmode()
+    if not ctypes.windll.user32.EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, ctypes.byref(mode)):
+        raise OSError("EnumDisplaySettingsW failed")
+    return int(mode.dmPelsWidth), int(mode.dmPelsHeight), int(mode.dmBitsPerPel), int(mode.dmDisplayFrequency)
+
+
+def list_display_modes() -> list[tuple[int, int, int, int]]:
+    modes: list[tuple[int, int, int, int]] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    index = 0
+    while True:
+        mode = _blank_devmode()
+        if not ctypes.windll.user32.EnumDisplaySettingsW(None, index, ctypes.byref(mode)):
+            break
+        item = (int(mode.dmPelsWidth), int(mode.dmPelsHeight), int(mode.dmBitsPerPel), int(mode.dmDisplayFrequency))
+        if item not in seen:
+            seen.add(item)
+            modes.append(item)
+        index += 1
+    modes.sort(key=lambda item: (item[0] * item[1], -item[3]))
+    return modes
+
+
+def pick_stream_resolution(requested: str | tuple[int, int]) -> tuple[int, int]:
+    available = {(w, h) for w, h, _bpp, _hz in list_display_modes()}
+    if requested != "auto":
+        width, height = requested
+        if (width, height) not in available:
+            raise SystemExit(
+                f"display cannot do {width}x{height}. Run with --list-res to see modes."
+            )
+        return width, height
+    for width, height in PREFERRED_RES:
+        if (width, height) in available:
+            return width, height
+    raise SystemExit("no low-res mode available; run --list-res")
+
+
+def set_display_mode(width: int, height: int) -> None:
+    cur = _blank_devmode()
+    if not ctypes.windll.user32.EnumDisplaySettingsW(None, ENUM_CURRENT_SETTINGS, ctypes.byref(cur)):
+        raise OSError("EnumDisplaySettingsW failed")
+    cur.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_BITSPERPEL | DM_DISPLAYFREQUENCY
+    cur.dmPelsWidth = width
+    cur.dmPelsHeight = height
+    rc = ctypes.windll.user32.ChangeDisplaySettingsW(ctypes.byref(cur), CDS_FULLSCREEN)
+    if rc != DISP_CHANGE_SUCCESSFUL:
+        raise OSError(f"ChangeDisplaySettingsW({width}x{height}) failed rc={rc}")
+
+
+def restore_display_mode() -> None:
+    ctypes.windll.user32.ChangeDisplaySettingsW(None, 0)
+
+
+def print_display_modes() -> int:
+    if sys.platform != "win32":
+        print("display modes are Windows-only", file=sys.stderr)
+        return 2
+    current = current_display_mode()
+    print(f"current {current[0]}x{current[1]} {current[2]}bpp {current[3]}Hz")
+    print("unique sizes (* = good for MiniToo stream):")
+    wanted = set(PREFERRED_RES)
+    unique: dict[tuple[int, int], tuple[int, int]] = {}
+    for width, height, bpp, hz in list_display_modes():
+        key = (width, height)
+        prev = unique.get(key)
+        if prev is None or hz > prev[1]:
+            unique[key] = (bpp, hz)
+    for (width, height), (bpp, hz) in unique.items():
+        mark = " *" if (width, height) in wanted else ""
+        print(f"  {width}x{height}  {bpp}bpp up to {hz}Hz{mark}")
+    return 0
 
 
 def cursor_xy() -> tuple[int, int] | None:
@@ -379,16 +560,54 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mac", help="MiniToo Bluetooth MAC (or DIVOOM_MAC)")
     parser.add_argument("--com", help="Windows Bluetooth serial port, e.g. COM16")
     parser.add_argument("--rfcomm-channel", type=int, default=0, help="Force RFCOMM channel (default: try 1 then 10)")
-    parser.add_argument("--fps", type=float, default=12.0, help="Capture cap. Actual rate is limited by Bluetooth ACKs.")
-    parser.add_argument("--clip-frames", type=int, default=1, help="Frames per 0x8B upload. 1 = lowest lag; 8+ = fewer LOADING flashes.")
-    parser.add_argument("--quality", type=int, default=35, help="JPEG quality 1-100")
+    parser.add_argument(
+        "--fps",
+        type=float,
+        default=12.0,
+        help="Capture/playback target. Actual rate is limited by one 0x8B round-trip per clip.",
+    )
+    parser.add_argument(
+        "--clip-frames",
+        type=int,
+        default=1,
+        help="Frames per 0x8B upload. 1 = lowest lag; 4-8 = higher fps, more delay.",
+    )
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Higher panel fps: 8 fps, 4-frame clips, no ACK wait, burst RFCOMM",
+    )
+    parser.add_argument("--quality", type=int, default=35, help="JPEG quality 1-100 (magic 0x23 only)")
+    parser.add_argument(
+        "--blob",
+        choices=("auto", "25", "23"),
+        default="auto",
+        help="0x8B payload: 25=app RGB+zstd, 23=JPEG, auto=25 then JPEG if zstd is too big",
+    )
     parser.add_argument("--fit", choices=("stretch", "contain", "cover"), default="stretch")
     parser.add_argument("--resample", choices=tuple(RESAMPLE_MODES), default="nearest")
     parser.add_argument("--pace-ms", type=int, default=0, help="Delay between RFCOMM chunks. 0 bursts writes.")
     parser.add_argument("--subsampling", type=int, default=2, choices=(0, 1, 2))
-    parser.add_argument("--announce-timeout", type=float, default=0.8)
+    parser.add_argument(
+        "--announce-timeout",
+        type=float,
+        default=0.0,
+        help="Seconds to wait for the 0x8B ready ACK before sending chunks. 0 = send immediately.",
+    )
+    parser.add_argument(
+        "--max-blob",
+        type=int,
+        default=12000,
+        help="With --blob auto, use JPEG if zstd is larger than this many bytes (0 = zstd until 64KB).",
+    )
     parser.add_argument("--bbox", type=parse_bbox, help="Capture region x,y,w,h in pixels")
     parser.add_argument("--all-screens", action="store_true", help="Grab the whole virtual desktop")
+    parser.add_argument(
+        "--res",
+        type=parse_res,
+        help="Temporarily set the Windows desktop to WxH (or auto) so UI is chunkier on 160x128. Restores on exit.",
+    )
+    parser.add_argument("--list-res", action="store_true", help="List Windows display modes and exit")
     parser.add_argument("--no-cursor", action="store_true", help="Do not draw a mouse marker")
     parser.add_argument("--seconds", type=float, help="Stop after this many seconds (Ctrl+C otherwise)")
     parser.add_argument("--dry-run", action="store_true", help="Capture and encode without connecting")
@@ -397,6 +616,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.list_res:
+        return print_display_modes()
     if args.fps <= 0:
         print("error: --fps must be positive", file=sys.stderr)
         return 2
@@ -406,86 +627,171 @@ def main() -> int:
     if args.clip_frames < 1:
         print("error: --clip-frames must be at least 1", file=sys.stderr)
         return 2
+    if args.fast:
+        args.fps = 8.0
+        args.clip_frames = 4
+        args.announce_timeout = 0.0
+        args.pace_ms = 0
+        print("fast preset: 8fps, 4-frame clips, send without ACK wait, burst writes")
+    if args.res is not None and args.bbox is not None:
+        print("error: --res cannot be combined with --bbox", file=sys.stderr)
+        return 2
+    if args.res is not None and sys.platform != "win32":
+        print("error: --res is Windows-only", file=sys.stderr)
+        return 2
 
-    speed_ms = MIN_SPEED_MS
     interval = 1.0 / args.fps
-    origin = desktop_rect(args.bbox, args.all_screens)
+    restored = True
+    original_mode = None
     grabber: GdiGrabber | None = None
-    if sys.platform == "win32":
-        try:
-            grabber = GdiGrabber()
-        except OSError as exc:
-            print(f"warning: GDI capture unavailable ({exc}); using ImageGrab", file=sys.stderr)
-
-    print(
-        f"desktop -> MiniToo  cap={args.fps:g} fps  clip={args.clip_frames}  "
-        f"q{args.quality}  {args.fit}  {origin[2]}x{origin[3]}  Ctrl+C to stop"
-    )
-
     transport = None
     sent = 0
+    frames_sent = 0
     t0 = time.time()
-    next_capture = t0
-    stat_t = t0
-    stat_n = 0
     try:
+        if args.res is not None and not args.dry_run:
+            original_mode = current_display_mode()
+            target = pick_stream_resolution(args.res)
+            print(
+                f"display {original_mode[0]}x{original_mode[1]} -> {target[0]}x{target[1]} "
+                f"(restores on exit)"
+            )
+            set_display_mode(target[0], target[1])
+            restored = False
+            time.sleep(0.3)
+        origin = desktop_rect(args.bbox, args.all_screens)
+        if sys.platform == "win32":
+            try:
+                grabber = GdiGrabber()
+            except OSError as exc:
+                print(f"warning: GDI capture unavailable ({exc}); using ImageGrab", file=sys.stderr)
+
+        print(
+            f"desktop -> MiniToo  cap={args.fps:g} fps  clip={args.clip_frames}  "
+            f"ack={args.announce_timeout:g}s  blob={args.blob}  max_blob={args.max_blob}  "
+            f"{args.fit}  {origin[2]}x{origin[3]}  Ctrl+C to stop"
+        )
+        if not args.dry_run:
+            try:
+                if usb_audio_present():
+                    print(
+                        "USB Divoom Audio is plugged in. Set Windows sound output to that "
+                        "speaker so A2DP does not share this SPP radio."
+                    )
+                else:
+                    print(
+                        "If MiniToo is your Bluetooth speaker, pause that audio or plug USB — "
+                        "A2DP shares this radio and will stall the screen."
+                    )
+            except Exception:
+                print(
+                    "If MiniToo is your Bluetooth speaker, pause that audio or plug USB — "
+                    "A2DP shares this radio and will stall the screen."
+                )
+
+        next_capture = time.time()
+        stat_t = next_capture
+        stat_n = 0
+        frames_sent = 0
+        t0 = time.time()
         if not args.dry_run:
             transport = connect(args)
-        while True:
-            if args.seconds is not None and time.time() - t0 >= args.seconds:
-                break
-            batch: list[bytes] = []
+
+        def grab_clip(*, paced: bool = True) -> list:
+            nonlocal next_capture
+            batch: list = []
             while len(batch) < args.clip_frames:
                 now = time.time()
                 if args.seconds is not None and now - t0 >= args.seconds:
                     break
-                wait = next_capture - now
-                if wait > 0:
-                    time.sleep(wait)
-                frame_img = capture_frame(
-                    grabber,
-                    args.bbox,
-                    args.all_screens,
-                    args.fit,
-                    args.resample,
-                    show_cursor=not args.no_cursor,
-                    origin=origin,
+                if paced:
+                    wait = next_capture - now
+                    if wait > 0:
+                        time.sleep(wait)
+                batch.append(
+                    capture_frame(
+                        grabber,
+                        args.bbox,
+                        args.all_screens,
+                        args.fit,
+                        args.resample,
+                        show_cursor=not args.no_cursor,
+                        origin=origin,
+                    )
                 )
-                batch.append(jpeg_bytes(frame_img, args.quality, subsampling=args.subsampling))
                 next_capture = time.time() + interval
+            return batch
+
+        pending: list | None = None
+        ema_xfer = 0.08
+        max_bytes = args.max_blob if args.blob == "auto" else 0
+        while True:
+            if args.seconds is not None and time.time() - t0 >= args.seconds:
+                break
+            batch = pending
+            pending = None
+            if batch is None:
+                batch = grab_clip()
             if not batch:
                 break
-            blob = encode_live_blob(batch, speed_ms)
+            # Device must keep this clip on screen until the next upload finishes.
+            # Next 0x8B is launched just before playback ends (not after), so the
+            # panel does not fall into LOADING.
+            capture_s = 0.0 if len(batch) == 1 else (len(batch) / args.fps)
+            hold_s = capture_s + 2.0 * ema_xfer + 0.04
+            speed_ms = max(MIN_SPEED_MS, min(400, int(round(1000 * hold_s / len(batch)))))
+            blob, used = encode_live_images(
+                batch,
+                speed_ms=speed_ms,
+                magic=args.blob,
+                quality=args.quality,
+                subsampling=args.subsampling,
+                max_bytes=max_bytes,
+            )
             play_s = len(batch) * speed_ms / 1000.0
             sent += 1
+            frames_sent += len(batch)
             if args.dry_run:
-                print(f"clip {sent}: frames={len(batch)} bytes={len(blob)} play={play_s:.2f}s")
+                print(f"clip {sent}: frames={len(batch)} magic=0x{used} bytes={len(blob)} play={play_s:.2f}s")
                 continue
             assert transport is not None
             started = time.time()
             chunks = send_live_clip(transport, blob, args.pace_ms / 1000.0, args.announce_timeout)
             xfer_s = time.time() - started
-            stat_n += 1
+            ema_xfer = 0.65 * ema_xfer + 0.35 * xfer_s
+            stat_n += len(batch)
             now = time.time()
             if now - stat_t >= 1.0:
-                print(f"{stat_n / (now - stat_t):.1f} fps  last {len(blob)}B / {chunks} chunks in {xfer_s:.2f}s")
+                print(
+                    f"{stat_n / (now - stat_t):.1f} fps  last 0x{used} {len(blob)}B / "
+                    f"{len(batch)}f {chunks}ch xfer={xfer_s:.2f}s hold={speed_ms}ms"
+                )
                 stat_t = now
                 stat_n = 0
-            wait_s = play_s - (time.time() - started)
-            if wait_s > 0:
-                time.sleep(wait_s)
-        print(f"done clips={sent} elapsed={time.time() - t0:.1f}s")
+            pending = grab_clip(paced=len(batch) > 1)
+            launch = started + play_s - ema_xfer - 0.02
+            delay = launch - time.time()
+            if delay > 0:
+                time.sleep(delay)
+        print(f"done clips={sent} frames={frames_sent} elapsed={time.time() - t0:.1f}s")
         return 0
     except KeyboardInterrupt:
         elapsed = time.time() - t0
-        hz = sent / elapsed if elapsed else 0
-        print(f"stopped clips={sent} elapsed={elapsed:.1f}s avg={hz:.1f} fps", file=sys.stderr)
+        hz = frames_sent / elapsed if elapsed else 0
+        print(f"stopped clips={sent} frames={frames_sent} elapsed={elapsed:.1f}s avg={hz:.1f} fps", file=sys.stderr)
         return 130
     finally:
         if transport is not None:
             transport.close()
         if grabber is not None:
             grabber.close()
+        if not restored:
+            try:
+                restore_display_mode()
+                if original_mode:
+                    print(f"display restored {original_mode[0]}x{original_mode[1]}")
+            except OSError as exc:
+                print(f"warning: could not restore display: {exc}", file=sys.stderr)
 
 
 if __name__ == "__main__":

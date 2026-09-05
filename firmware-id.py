@@ -61,6 +61,9 @@ def describe(packet: bytes) -> str:
         if body and body.startswith(KEEPALIVE_PREFIX):
             return f"keepalive {body.hex(' ')}"
         return f"ack op={echoed:02x} body={body.hex(' ') if body else ''}"
+    if op == 0x9D:
+        body = packet[4:-3] if len(packet) >= 8 else packet
+        return f"keepalive-9d {body.hex(' ')}"
     return f"op={op:02x} {packet.hex(' ')}"
 
 

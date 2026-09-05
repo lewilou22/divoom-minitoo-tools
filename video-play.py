@@ -4,8 +4,11 @@
 The MiniToo is not a video player. This tool:
 
   1. Scales frames to 160x128 (8x10 cells)
-  2. JPEG-encodes them into the proven live-animation blob (opcode 0x8B)
+  2. Encodes them into a live-animation blob (opcode 0x8B)
   3. Pushes 256-byte chunks over Classic RFCOMM / a Bluetooth COM port
+
+Default encoding is magic 0x25 (RGB + zstd), matching the official Android app.
+If a clip's zstd payload exceeds 64 KB, it falls back to the proven 0x23 JPEG blob.
 
 A single upload holds at most 255 frames. Longer files are sent as successive
 clips. USB (the cable you are listening on) is speakers + media keys only —
@@ -40,9 +43,8 @@ from minitoo_protocol import (
     MAX_FRAMES,
     MIN_SPEED_MS,
     RESAMPLE_MODES,
-    encode_live_blob,
+    encode_live_images,
     is_live_ready,
-    jpeg_bytes,
     live_announce,
     live_chunk_frames,
     render_frame,
@@ -147,15 +149,10 @@ def iter_source_frames(
     yield from iter_ffmpeg_frames(path, fps, fit, start_s=start_s, seconds=seconds)
 
 
-def clip_jpegs(
-    images: Iterator[Image.Image],
-    clip_frames: int,
-    quality: int,
-    subsampling: int = 0,
-) -> Iterator[list[bytes]]:
-    batch: list[bytes] = []
+def clip_images(images: Iterator[Image.Image], clip_frames: int) -> Iterator[list[Image.Image]]:
+    batch: list[Image.Image] = []
     for img in images:
-        batch.append(jpeg_bytes(img.convert("RGB"), quality, subsampling=subsampling))
+        batch.append(img.convert("RGB"))
         if len(batch) >= clip_frames:
             yield batch
             batch = []
@@ -246,7 +243,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--speed-ms", type=positive_int, help="Override per-frame delay in ms (default: 1000/fps)")
     parser.add_argument("--fast", action="store_true", help="Fewer loads: 6 fps, q40, 96-frame clips, burst RFCOMM writes")
     parser.add_argument("--clip-frames", type=positive_int, default=24, help="Frames per 0x8B upload (max 255). Bigger = less loading.")
-    parser.add_argument("--quality", type=int, default=70, help="JPEG quality 1-100")
+    parser.add_argument("--quality", type=int, default=70, help="JPEG quality 1-100 (magic 0x23 only)")
+    parser.add_argument(
+        "--blob",
+        choices=("auto", "25", "23"),
+        default="auto",
+        help="0x8B payload: 25=app RGB+zstd, 23=JPEG, auto=25 then JPEG if zstd is too big",
+    )
     parser.add_argument("--fit", choices=("stretch", "contain", "cover"), default="contain")
     parser.add_argument("--resample", choices=tuple(RESAMPLE_MODES), default="lanczos")
     parser.add_argument("--pace-ms", type=int, default=5, help="Delay between RFCOMM chunks. 0 bursts writes (faster).")
@@ -319,6 +322,7 @@ def main() -> int:
         args.audio = True
 
     speed_ms = args.speed_ms or max(MIN_SPEED_MS, int(round(1000 / args.fps)))
+    print(f"blob={args.blob}  speed_ms={speed_ms}  clip_frames={args.clip_frames}")
     frames = iter_source_frames(
         args.input,
         args.fps,
@@ -327,25 +331,34 @@ def main() -> int:
         start_s=args.start,
         seconds=args.seconds,
     )
-    clips = clip_jpegs(frames, args.clip_frames, args.quality, subsampling=args.subsampling)
+    clips = clip_images(frames, args.clip_frames)
 
     if args.encode_only:
         if args.output is None:
             print("error: --encode-only needs -o <file.raw>", file=sys.stderr)
             return 2
-        jpegs: list[bytes] = []
+        all_frames: list[Image.Image] = []
         for batch in clips:
-            jpegs.extend(batch)
-            if len(jpegs) > MAX_FRAMES:
+            all_frames.extend(batch)
+            if len(all_frames) > MAX_FRAMES:
                 print(
-                    f"error: file encodes to {len(jpegs)}+ frames; "
+                    f"error: file encodes to {len(all_frames)}+ frames; "
                     f"lower --fps or omit --encode-only and play in clips",
                     file=sys.stderr,
                 )
                 return 1
-        blob = encode_live_blob(jpegs, speed_ms)
+        blob, used = encode_live_images(
+            all_frames,
+            speed_ms=speed_ms,
+            magic=args.blob,
+            quality=args.quality,
+            subsampling=args.subsampling,
+        )
         chunks = write_live_rawfile(blob, str(args.output))
-        print(f"wrote {args.output} frames={len(jpegs)} speed_ms={speed_ms} bytes={len(blob)} chunks={chunks}")
+        print(
+            f"wrote {args.output} frames={len(all_frames)} speed_ms={speed_ms} "
+            f"magic=0x{used} bytes={len(blob)} chunks={chunks}"
+        )
         return 0
 
     audio_proc = None
@@ -367,12 +380,18 @@ def main() -> int:
         while pending is not None:
             clip_index += 1
             batch = pending
-            blob = encode_live_blob(batch, speed_ms)
+            blob, used = encode_live_images(
+                batch,
+                speed_ms=speed_ms,
+                magic=args.blob,
+                quality=args.quality,
+                subsampling=args.subsampling,
+            )
             total_frames += len(batch)
             total_bytes += len(blob)
             play_s = len(batch) * speed_ms / 1000.0
             print(
-                f"clip {clip_index}: frames={len(batch)} bytes={len(blob)} "
+                f"clip {clip_index}: frames={len(batch)} magic=0x{used} bytes={len(blob)} "
                 f"chunks={(len(blob) + 255) // 256} play={play_s:.2f}s"
             )
             if args.dry_run:
@@ -383,7 +402,7 @@ def main() -> int:
             chunks = send_live_clip(transport, blob, args.pace_ms / 1000.0, args.announce_timeout)
             xfer_s = time.time() - send_started
             print(f"  sent {chunks} chunks in {xfer_s:.2f}s")
-            # Encode the next JPEG batch during playback, but do not announce
+            # Encode the next clip during playback, but do not announce
             # another 0x8B until this clip has finished. Overlapping uploads
             # froze the panel.
             pending = next(clip_iter, None)
