@@ -2,4 +2,4 @@
 
 Windows Tools for the divoom minitoo
 
-Display driver on windows 
+Display driver on windows  1FPS 
