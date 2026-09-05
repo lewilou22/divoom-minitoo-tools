@@ -11,3 +11,8 @@ Other files can be used for upload and various other things
 
 <img width="1920" height="2560" alt="cf424cf6-eeb0-498f-aec0-2c133139e0ba" src="https://github.com/user-attachments/assets/4a1453a8-7be4-4ba8-9928-79da4550c8fb" />
 <img width="1920" height="2560" alt="3d5f55d8-dd8d-444d-adb4-5b6412774f67" src="https://github.com/user-attachments/assets/e1ab33c6-5e10-4df3-9ce5-def9925fd667" />
+
+
+py -3 core/taskman-play.py
+
+<img width="1920" height="2560" alt="image" src="https://github.com/user-attachments/assets/0ca82c78-c163-473a-8218-ffd2c1d9067d" />
