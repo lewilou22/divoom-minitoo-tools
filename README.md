@@ -3,7 +3,7 @@
 
 Windows Tools for the divoom minitoo
 
-Display driver on windows  1FPS 
+Display driver on windows  10FPS  + Full BT Audio & Video
 
 To run: divoom-minitoo\core> py -3 screen-play.py
 
