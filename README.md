@@ -17,6 +17,6 @@ py -3 core/taskman-play.py
 
 <img width="1920" height="2560" alt="image" src="https://github.com/user-attachments/assets/0ca82c78-c163-473a-8218-ffd2c1d9067d" />
 
-Continued work from : 
+Original findings credit : 
 
 https://github.com/bugzmanov/divoom-minitoo
